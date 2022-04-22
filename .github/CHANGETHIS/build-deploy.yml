@@ -1,0 +1,125 @@
+name: build and deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write # for azure/login with OpenID Connect
+  contents: read
+
+env:
+  # TODO: Update this
+  SQL_SERVER: 
+  DATABASENAME: 
+  ACR: 
+  AKS_CLUSTER_NAME: 
+  RESOURCE_GROUP_NAME: 
+
+jobs:
+  build:
+    runs-on: ubuntu-18.04
+
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Set image tag from workflow run-number
+        id: setImageTag
+        run: |
+          echo "::set-output name=IMAGE_TAG::${{ github.run_number }}"
+
+      - name: Replace tokens in src/MyHealth.Web/appsettings.json with env
+        uses: cschleiden/replace-tokens@v1.1
+        with:
+          tokenPrefix: '__'
+          tokenSuffix: '__'
+          files: '["src/MyHealth.Web/appsettings.json"]'
+        env:
+          SQL_USER: ${{ secrets.SQL_USER }}
+          SQL_PASSWORD: ${{ secrets.SQL_PASSWORD }}
+
+      # dotnet build
+      # https://docs.microsoft.com/ja-jp/dotnet/architecture/devops-for-aspnet-developers/actions-build
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: 2.0.0
+
+      - name: Restore .NET dependencies
+        run: dotnet restore ./MHC_ASPNetCore.sln
+
+      - name: Build .NET app
+        run: dotnet publish ./MHC_ASPNetCore.sln -c Release -o ./obj/Docker/publish
+
+      # docker build & push
+      # https://docs.microsoft.com/ja-jp/azure/developer/github/connect-from-azure?tabs=azure-portal%2Clinux
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }} 
+
+      - name: Build docker image, login to ACR and push image to ACR
+        run: |
+          # Build docker image
+          docker build . -t ${{ env.ACR }}/myhealth.web:${{ steps.setImageTag.outputs.IMAGE_TAG }} -t ${{ env.ACR }}/myhealth.web:latest
+          # Login to ACR
+          # https://github.com/Azure/acr/blob/main/docs/AAD-OAuth.md#authenticating-to-a-registry-with-azure-cli
+          az acr login -n ${{ env.ACR }}
+          # Push image to ACR
+          docker push -a ${{ env.ACR }}/myhealth.web
+        env:
+          TAG: ${{ github.run_number }}
+        working-directory: ./src/MyHealth.Web
+
+    outputs:
+      IMAGE_TAG: ${{ steps.setImageTag.outputs.IMAGE_TAG}}
+
+  deploy:
+    needs: [build]
+    runs-on: ubuntu-18.04
+
+    steps:
+      - uses: actions/checkout@main
+
+      # https://docs.microsoft.com/ja-jp/azure/developer/github/connect-from-azure?tabs=azure-portal%2Clinux
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # https://docs.microsoft.com/ja-jp/azure/azure-sql/database/connect-github-actions-sql-db
+      - name: Apply Dacpac to Azure SQL server
+        uses: azure/sql-action@v1.2
+        with:
+          server-name: ${{ env.SQL_SERVER }}
+          connection-string: "Server=tcp:${{ env.SQL_SERVER }},1433;Initial Catalog=${{ env.DATABASENAME }};Persist Security Info=False;User ID=${{ secrets.SQL_USER }};Password=${{ secrets.SQL_PASSWORD }};MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+          dacpac-package: './myhealthclinic.dacpac'
+
+      - name: Replace tokens in mhc-aks.yaml with env
+        uses: cschleiden/replace-tokens@v1.1
+        with:
+          tokenPrefix: '__'
+          tokenSuffix: '__'
+          files: '["mhc-aks.yaml"]'
+        env:
+          ACR: ${{ env.ACR }}
+
+      # AKS
+      - name: Prepeare k8s context
+        uses: azure/aks-set-context@v2.0
+        with:
+          resource-group: ${{ env.RESOURCE_GROUP_NAME }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+      - name: Create Deployments & Services in AKS
+        uses: azure/k8s-deploy@v1
+        with:
+          manifests: |
+            ./mhc-aks.yaml
+
+      - name: Update image in AKS
+        run: | 
+          kubectl set image deployments/mhc-front mhc-front=${{ env.ACR }}/myhealth.web:${{ needs.build.outputs.IMAGE_TAG }}
